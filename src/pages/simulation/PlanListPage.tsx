@@ -1,4 +1,5 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router';
 import {
   Plus, Search, Filter, Download, Archive, Trash2,
@@ -72,6 +73,29 @@ function NewPlanModal({ onClose, onConfirm }: { onClose: () => void; onConfirm: 
   );
 }
 
+function DeleteConfirmModal({ title, warning, strong, onClose, onConfirm }: {
+  title: string;
+  warning: string;
+  strong?: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+      <div className="bg-[#0b1d30] border border-[#1e3a55] rounded-2xl p-6 w-[420px] shadow-2xl">
+        <h2 className="text-base font-semibold text-slate-200 mb-2">{title}</h2>
+        <p className={cn('text-xs leading-relaxed', strong ? 'text-amber-300' : 'text-slate-400')}>
+          {warning}
+        </p>
+        <div className="flex justify-end gap-2 mt-6">
+          <Button variant="ghost" onClick={onClose}>取消</Button>
+          <Button variant="danger" onClick={onConfirm}>确认删除</Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const STATUS_FILTER_OPTIONS: Array<{ label: string; value: PlanStatus | 'ALL' }> = [
   { label: '全部状态', value: 'ALL' },
   { label: '草稿', value: 'DRAFT' },
@@ -90,6 +114,7 @@ export function PlanListPage() {
   const [statusFilter, setStatusFilter] = useState<PlanStatus | 'ALL'>('ALL');
   const [selected, setSelected] = useState<string[]>([]);
   const [factoryId, setFactoryId] = useState<string>('');
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
 
   const loadPlans = useCallback(async () => {
     setLoading(true);
@@ -206,7 +231,7 @@ export function PlanListPage() {
               <Button size="xs" variant="ghost" onClick={async () => { await planApi.batchArchive(selected); setSelected([]); loadPlans(); }}>
                 <Archive size={12} /> 批量归档
               </Button>
-              <Button size="xs" variant="danger" onClick={async () => { await planApi.batchDelete(selected); setSelected([]); loadPlans(); }}>
+              <Button size="xs" variant="danger" onClick={() => setBulkDeleteOpen(true)}>
                 <Trash2 size={12} /> 批量删除
               </Button>
             </div>
@@ -326,16 +351,64 @@ export function PlanListPage() {
       {showNewModal && (
         <NewPlanModal onClose={() => setShowNewModal(false)} onConfirm={handleNewPlan} />
       )}
+      {bulkDeleteOpen && (() => {
+        const selectedPlans = plans.filter(p => selected.includes(p.id));
+        const completedCount = selectedPlans.filter(p => p.status === 'COMPLETED').length;
+        const warning = completedCount > 0
+          ? `已选 ${selected.length} 个方案，其中 ${completedCount} 个已完成仿真。删除将同步清除仿真结果、AI 分析、产线平衡结果、状态快照和归档版本，且无法恢复。确认继续？`
+          : `确定删除已选的 ${selected.length} 个方案吗？此操作不可恢复。`;
+        return (
+          <DeleteConfirmModal
+            title="批量删除方案"
+            warning={warning}
+            strong={completedCount > 0}
+            onClose={() => setBulkDeleteOpen(false)}
+            onConfirm={async () => {
+              setBulkDeleteOpen(false);
+              await planApi.batchDelete(selected);
+              setSelected([]);
+              loadPlans();
+            }}
+          />
+        );
+      })()}
     </div>
   );
 }
 
 function PlanActions({ plan, navigate, onRefresh }: { plan: SimPlan; navigate: ReturnType<typeof useNavigate>; onRefresh: () => void }) {
   const [open, setOpen] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [menuPos, setMenuPos] = useState<{ top: number; right: number } | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const rect = triggerRef.current?.getBoundingClientRect();
+    if (rect) setMenuPos({ top: rect.bottom + 4, right: window.innerWidth - rect.right });
+
+    const onClick = (e: MouseEvent) => {
+      if (menuRef.current?.contains(e.target as Node)) return;
+      if (triggerRef.current?.contains(e.target as Node)) return;
+      setOpen(false);
+    };
+    window.addEventListener('mousedown', onClick);
+    window.addEventListener('scroll', () => setOpen(false), true);
+    return () => {
+      window.removeEventListener('mousedown', onClick);
+      window.removeEventListener('scroll', () => setOpen(false), true);
+    };
+  }, [open]);
 
   const handleArchive = async () => { setOpen(false); await planApi.archive(plan.id); onRefresh(); };
   const handleCopy = async () => { setOpen(false); await planApi.copy(plan.id); onRefresh(); };
-  const handleDelete = async () => { setOpen(false); await planApi.delete(plan.id); onRefresh(); };
+  const handleDelete = async () => { setConfirmOpen(false); await planApi.delete(plan.id); onRefresh(); };
+
+  const isCompleted = plan.status === 'COMPLETED';
+  const deleteWarning = isCompleted
+    ? `方案「${plan.name}」已完成仿真。删除将同步清除仿真结果、AI 分析、产线平衡结果、状态快照和归档版本，且无法恢复。确认继续？`
+    : `确定删除方案「${plan.name}」吗？此操作不可恢复。`;
 
   return (
     <div className="flex items-center gap-1">
@@ -364,28 +437,40 @@ function PlanActions({ plan, navigate, onRefresh }: { plan: SimPlan; navigate: R
           <FileBarChart size={11} /> 报表
         </Button>
       )}
-      <div className="relative">
-        <Button size="xs" variant="ghost" onClick={() => setOpen(!open)}>
-          <MoreHorizontal size={12} />
-        </Button>
-        {open && (
-          <div className="absolute right-0 top-7 z-10 bg-[#0b1d30] border border-[#1e3a55] rounded-xl shadow-xl w-36 py-1">
-            {['DRAFT','READY','COMPLETED'].includes(plan.status) && (
-              <button onClick={handleArchive} className="w-full text-left px-3 py-2 text-xs text-slate-300 hover:bg-[#0d2035] flex items-center gap-2">
-                <Archive size={12} /> 归档
-              </button>
-            )}
-            <button onClick={handleCopy} className="w-full text-left px-3 py-2 text-xs text-slate-300 hover:bg-[#0d2035] flex items-center gap-2">
-              复制方案
+      <Button ref={triggerRef} size="xs" variant="ghost" onClick={() => setOpen(!open)}>
+        <MoreHorizontal size={12} />
+      </Button>
+      {open && menuPos && createPortal(
+        <div
+          ref={menuRef}
+          style={{ position: 'fixed', top: menuPos.top, right: menuPos.right }}
+          className="z-50 bg-[#0b1d30] border border-[#1e3a55] rounded-xl shadow-xl w-36 py-1"
+        >
+          {['DRAFT','READY','COMPLETED'].includes(plan.status) && (
+            <button onClick={handleArchive} className="w-full text-left px-3 py-2 text-xs text-slate-300 hover:bg-[#0d2035] flex items-center gap-2">
+              <Archive size={12} /> 归档
             </button>
-            {plan.status === 'DRAFT' && (
-              <button onClick={handleDelete} className="w-full text-left px-3 py-2 text-xs text-red-400 hover:bg-[#0d2035] flex items-center gap-2">
-                <Trash2 size={12} /> 删除
-              </button>
-            )}
-          </div>
-        )}
-      </div>
+          )}
+          <button onClick={handleCopy} className="w-full text-left px-3 py-2 text-xs text-slate-300 hover:bg-[#0d2035] flex items-center gap-2">
+            复制方案
+          </button>
+          {plan.status !== 'RUNNING' && plan.status !== 'ARCHIVED' && (
+            <button onClick={() => { setOpen(false); setConfirmOpen(true); }} className="w-full text-left px-3 py-2 text-xs text-red-400 hover:bg-[#0d2035] flex items-center gap-2">
+              <Trash2 size={12} /> 删除
+            </button>
+          )}
+        </div>,
+        document.body,
+      )}
+      {confirmOpen && (
+        <DeleteConfirmModal
+          title="删除方案"
+          warning={deleteWarning}
+          strong={isCompleted}
+          onClose={() => setConfirmOpen(false)}
+          onConfirm={handleDelete}
+        />
+      )}
     </div>
   );
 }

@@ -1,11 +1,16 @@
 import type {
   BopOut,
   ConstraintOut,
+  EquipmentFailureParamOut,
   EquipmentOut,
   FactoryOut,
+  InventorySnapshotOut,
   LineBalanceOut,
+  LineEquipmentConfigOut,
   LineOut,
+  MaterialSupplyOut,
   OperationOut,
+  OperationTransitionOut,
   OverrideOut,
   PlanCreate,
   PlanOut,
@@ -16,6 +21,7 @@ import type {
   SimResultOut,
   StageOut,
   TaskOut,
+  WIPBufferSnapshotOut,
 } from '@/types/api';
 
 const BASE = '/api/v1';
@@ -93,12 +99,19 @@ export const planApi = {
   events: (id: string) =>
     api<SimEventsOut>(`/plans/${id}/result/events`),
 
+  // Business snapshots (read-only)
+  materialSupplies: (id: string) => api<MaterialSupplyOut[]>(`/plans/${id}/material-supplies`),
+  inventorySnapshots: (id: string) => api<InventorySnapshotOut[]>(`/plans/${id}/inventory-snapshots`),
+  wipSnapshots: (id: string) => api<WIPBufferSnapshotOut[]>(`/plans/${id}/wip-snapshots`),
+
   // Sub-resources
   tasks: (id: string) => api<TaskOut[]>(`/plans/${id}/tasks`),
   createTask: (id: string, body: Record<string, unknown>) =>
     api<TaskOut>(`/plans/${id}/tasks`, { method: 'POST', body: JSON.stringify(body) }),
   deleteTask: (id: string, taskId: string) =>
     api<void>(`/plans/${id}/tasks/${taskId}`, { method: 'DELETE' }),
+  replaceTasks: (id: string, tasks: Array<Record<string, unknown>>) =>
+    api<TaskOut[]>(`/plans/${id}/tasks`, { method: 'PUT', body: JSON.stringify({ tasks }) }),
 
   constraints: (id: string) => api<ConstraintOut[]>(`/plans/${id}/constraints`),
   setConstraint: (id: string, body: { constraint_type: string; is_enabled: boolean }) =>
@@ -170,5 +183,10 @@ export const masterApi = {
   operations: (lineId: string) => api<OperationOut[]>(`/factories/lines/${lineId}/operations`),
   bop: (lineId: string) => api<BopOut>(`/factories/lines/${lineId}/bop`),
   equipment: (opId: string) => api<EquipmentOut[]>(`/factories/operations/${opId}/equipment`),
+  transitions: (lineId: string) => api<OperationTransitionOut[]>(`/factories/lines/${lineId}/transitions`),
+  equipmentFailureParams: (factoryId: string) =>
+    api<EquipmentFailureParamOut[]>(`/factories/${factoryId}/equipment-failure-params`),
+  equipmentConfig: (factoryId: string) =>
+    api<LineEquipmentConfigOut>(`/factories/${factoryId}/equipment-config`),
   products: () => api<ProductOut[]>('/products'),
 };

@@ -150,6 +150,87 @@ export interface TaskOut {
   production_sequence: number;
 }
 
+export interface OperationTransitionOut {
+  transition_id: string;
+  bop_id: string;
+  from_operation_id: string;
+  to_operation_id: string;
+  transfer_time: number;
+  mandatory_wait_time: number;
+  transfer_mode: string | null;
+  wait_reason: string | null;
+}
+
+export interface EquipmentFailureParamOut {
+  param_id: string;
+  equipment_id: string;
+  mtbf_hours: number;
+  mttr_minutes: number;
+  failure_distribution: string | null;
+  data_source: string | null;
+}
+
+export interface LineEquipmentConfigItem {
+  equipment_id: string;
+  equipment_code: string;
+  equipment_name: string;
+  equipment_type: string;
+  manufacturer: string | null;
+  model_no: string | null;
+  standard_ct: number | null;
+  operation_id: string;
+  operation_code: string;
+  operation_name: string;
+  operation_sequence: number;
+  line_id: string;
+  line_code: string;
+  line_name: string;
+  stage_id: string;
+  stage_name: string;
+}
+
+export interface LineEquipmentConfigOut {
+  factory_id: string;
+  line_count: number;
+  operation_count: number;
+  equipment_count: number;
+  last_updated: string | null;
+  items: LineEquipmentConfigItem[];
+}
+
+export interface MaterialSupplyOut {
+  supply_id: string;
+  plan_id: string;
+  material_code: string;
+  material_name: string | null;
+  supply_quantity: number;
+  arrival_sim_hour: number;
+  target_warehouse_id: string;
+  data_source: string;
+}
+
+export interface InventorySnapshotOut {
+  snapshot_id: string;
+  plan_id: string;
+  warehouse_id: string;
+  material_code: string;
+  total_quantity: number;
+  available_quantity: number;
+  snapshot_time: string;
+  data_source: string;
+}
+
+export interface WIPBufferSnapshotOut {
+  wip_snapshot_id: string;
+  plan_id: string;
+  wip_id: string;
+  material_code: string;
+  current_quantity: number;
+  current_volume: number;
+  snapshot_time: string;
+  data_source: string;
+}
+
 // --- Simulation Results ---
 
 export interface RunStatus {

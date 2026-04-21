@@ -4,12 +4,13 @@ import {
   ChevronLeft, Save, CheckCircle2, AlertCircle, Upload, RefreshCw,
   ChevronDown, ChevronRight, Database, Cpu, Truck, Package, Layers,
   Sliders, Settings2, Building2, Plus, Info, X, BookOpen, Play,
+  ClipboardList, ArrowUp, ArrowDown, Trash2,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Input, Select } from '@/components/ui/Input';
 import { Button } from '@/components/ui/Button';
-import { planApi, masterApi } from '@/lib/api';
-import type { PlanOut, BopOut, BopProcessOut } from '@/types/api';
+import { planApi, masterApi, simulatorsToFrontend, simulatorsToBackend } from '@/lib/api';
+import type { PlanOut, BopOut, BopProcessOut, ProductOut, StageOut, LineOut } from '@/types/api';
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 type NodeType = 'group' | 'line' | 'operation' | 'agv' | 'material' | 'factory';
@@ -1155,11 +1156,215 @@ const SOURCE_BADGE: Record<string, string> = {
   'MES':        'text-cyan-400 bg-cyan-500/10 border-cyan-500/20',
 };
 
-function DataTablePanel() {
+type SectionOverride = Partial<Pick<DataSection, 'cols' | 'rows' | 'summary' | 'status' | 'warning'>>;
+
+function DataTablePanel({ planId, factoryId }: { planId: string | undefined; factoryId: string | undefined }) {
   const [expanded, setExpanded] = useState<string[]>(['production-tasks']);
+  const [overrides, setOverrides] = useState<Record<string, SectionOverride>>({});
+  const [noWoOpen, setNoWoOpen] = useState(false);
+  const [tasksReloadTick, setTasksReloadTick] = useState(0);
 
   const toggle = (id: string) =>
     setExpanded(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+
+  // Wire production-tasks
+  useEffect(() => {
+    if (!planId) return;
+    planApi.tasks(planId).then(tasks => {
+      const rows = tasks.map(t => [
+        t.task_id.slice(0, 8),
+        t.product_code,
+        `${t.plan_quantity} pcs`,
+        String(t.completed_qty ?? 0),
+        String(t.production_sequence),
+      ]);
+      const totalQty = tasks.reduce((s, t) => s + (t.plan_quantity ?? 0), 0);
+      const productCount = new Set(tasks.map(t => t.product_code)).size;
+      setOverrides(prev => ({
+        ...prev,
+        'production-tasks': {
+          cols: ['任务ID', '产品型号', '计划产量', '已完成', '序号'],
+          rows,
+          summary: tasks.length
+            ? `工单 ${tasks.length} 条 · 产品型号 ${productCount} 种 · 总计划产量 ${totalQty.toLocaleString()} pcs`
+            : '暂无工单',
+          status: tasks.length ? 'ok' : 'missing',
+        },
+      }));
+    }).catch(() => {});
+  }, [planId, tasksReloadTick]);
+
+  // Wire BOP + operation-transitions + equipment-failure-params — iterate lines
+  useEffect(() => {
+    if (!factoryId) return;
+    (async () => {
+      try {
+        const stages = await masterApi.stages(factoryId);
+        const bopRows: string[][] = [];
+        const transitionRows: string[][] = [];
+        for (const stage of stages) {
+          const lines = await masterApi.lines(stage.stage_id);
+          for (const line of lines) {
+            const opById = new Map<string, string>();
+            try {
+              const ops = await masterApi.operations(line.line_id);
+              ops.forEach(o => opById.set(o.operation_id, o.operation_name));
+            } catch { /* ignore */ }
+
+            try {
+              const bop = await masterApi.bop(line.line_id);
+              if (bop) {
+                bopRows.push([
+                  bop.bop_id.slice(0, 8),
+                  bop.product_id.slice(0, 8),
+                  line.line_name,
+                  `${bop.processes.length} 道`,
+                  bop.is_active ? '激活' : '停用',
+                ]);
+              }
+            } catch { /* no bop */ }
+
+            try {
+              const transitions = await masterApi.transitions(line.line_id);
+              for (const t of transitions) {
+                transitionRows.push([
+                  opById.get(t.from_operation_id) ?? t.from_operation_id.slice(0, 8),
+                  opById.get(t.to_operation_id) ?? t.to_operation_id.slice(0, 8),
+                  line.line_name,
+                  String(Number(t.transfer_time)),
+                  String(Number(t.mandatory_wait_time)),
+                ]);
+              }
+            } catch { /* ignore */ }
+          }
+        }
+        const activeCount = bopRows.filter(r => r[4] === '激活').length;
+        setOverrides(prev => ({
+          ...prev,
+          'bop': {
+            rows: bopRows,
+            summary: bopRows.length ? `${activeCount} 个激活版本 · 覆盖 ${bopRows.length} 条产线` : '暂无 BOP 配置',
+            status: bopRows.length ? 'ok' : 'missing',
+          },
+          'op-transition': {
+            rows: transitionRows,
+            summary: transitionRows.length
+              ? `${transitionRows.length} 段工序间配置`
+              : '暂无工序间接续配置',
+            status: transitionRows.length ? 'ok' : 'missing',
+          },
+        }));
+      } catch { /* ignore */ }
+    })();
+
+    // Equipment failure params
+    masterApi.equipmentFailureParams(factoryId).then(params => {
+      const rows = params.map(p => [
+        p.equipment_id.slice(0, 8),
+        '—',
+        String(Number(p.mtbf_hours)),
+        String(Number(p.mttr_minutes)),
+        p.failure_distribution === 'EXPONENTIAL' ? '指数分布' : (p.failure_distribution ?? '—'),
+      ]);
+      setOverrides(prev => ({
+        ...prev,
+        'equipment-params': {
+          rows,
+          summary: rows.length
+            ? `${rows.length} 台设备 · 均已配置 MTBF/MTTR`
+            : '暂无设备故障参数',
+          status: rows.length ? 'ok' : 'missing',
+        },
+      }));
+    }).catch(() => {});
+
+    // 产线设备配置 (dedicated aggregated endpoint)
+    masterApi.equipmentConfig(factoryId).then(cfg => {
+      const rows = cfg.items.map(it => [
+        it.equipment_code,
+        it.operation_name,
+        it.line_name,
+        it.equipment_type,
+        it.standard_ct != null ? String(Number(it.standard_ct)) : '—',
+      ]);
+      setOverrides(prev => ({
+        ...prev,
+        'equipment-config': {
+          rows,
+          summary: rows.length
+            ? `${cfg.line_count} 条产线 · ${cfg.equipment_count} 台关键设备 · ${cfg.operation_count} 道工序`
+            : '暂无设备配置',
+          status: rows.length ? 'ok' : 'missing',
+        },
+      }));
+    }).catch(() => {});
+  }, [factoryId]);
+
+  // Wire plan-scoped business snapshots
+  useEffect(() => {
+    if (!planId) return;
+
+    planApi.materialSupplies(planId).then(supplies => {
+      const rows = supplies.map(s => [
+        s.material_code,
+        s.material_name ?? '—',
+        `${Number(s.supply_quantity).toLocaleString()} pcs`,
+        `T+${Number(s.arrival_sim_hour).toFixed(1)}h`,
+        s.data_source,
+      ]);
+      const matTypes = new Set(supplies.map(s => s.material_code)).size;
+      setOverrides(prev => ({
+        ...prev,
+        'material-supply': {
+          rows,
+          summary: rows.length
+            ? `物料种类 ${matTypes} 种 · 供应批次 ${rows.length} 批`
+            : '暂无物料供应计划',
+          status: rows.length ? 'ok' : 'missing',
+        },
+      }));
+    }).catch(() => {});
+
+    planApi.inventorySnapshots(planId).then(snaps => {
+      const rows = snaps.map(s => [
+        s.warehouse_id.slice(0, 8),
+        s.material_code,
+        Number(s.total_quantity).toLocaleString(),
+        Number(s.available_quantity).toLocaleString(),
+        s.snapshot_time?.slice(0, 16).replace('T', ' ') ?? '—',
+      ]);
+      setOverrides(prev => ({
+        ...prev,
+        'inventory': {
+          cols: ['仓库', '物料编码', '库存总量', '可用量', '快照时间'],
+          rows,
+          summary: rows.length ? `${rows.length} 条库存快照` : '暂无库存快照',
+          status: rows.length ? 'ok' : 'missing',
+          warning: rows.length ? undefined : '未配置库存快照，仿真将假设初始库存为零',
+        },
+      }));
+    }).catch(() => {});
+
+    planApi.wipSnapshots(planId).then(snaps => {
+      const rows = snaps.map(s => [
+        s.wip_id.slice(0, 8),
+        s.material_code,
+        Number(s.current_quantity).toLocaleString(),
+        Number(s.current_volume).toFixed(3),
+        s.snapshot_time?.slice(0, 16).replace('T', ' ') ?? '—',
+      ]);
+      setOverrides(prev => ({
+        ...prev,
+        'wip': {
+          cols: ['线边仓', '物料编码', '当前数量', '占用体积', '快照时间'],
+          rows,
+          summary: rows.length ? `${rows.length} 条线边仓快照` : '暂无线边仓快照',
+          status: rows.length ? 'ok' : 'missing',
+          warning: rows.length ? undefined : '未配置线边仓快照，仿真将以各线边仓空仓状态启动',
+        },
+      }));
+    }).catch(() => {});
+  }, [planId]);
 
   const groups = [
     { label: '基础数据', note: '来自主数据平台（只读，版本锁定）', ids: ['bop', 'equipment-config', 'staffing', 'changeover', 'op-transition', 'calendar', 'equipment-params'] },
@@ -1182,7 +1387,8 @@ function DataTablePanel() {
               <span className="text-[10px] text-slate-700">{group.note}</span>
             </div>
             <div className="space-y-2">
-              {sections.map(sec => {
+              {sections.map(base => {
+                const sec = { ...base, ...overrides[base.id] };
                 const isExpanded = expanded.includes(sec.id);
                 return (
                   <div key={sec.id} className={cn(
@@ -1225,6 +1431,11 @@ function DataTablePanel() {
 
                       {/* Action buttons */}
                       <div className="flex items-center gap-1.5 flex-shrink-0" onClick={e => e.stopPropagation()}>
+                        {sec.id === 'production-tasks' && (
+                          <Button size="xs" variant="outline" onClick={() => setNoWoOpen(true)}>
+                            <ClipboardList size={10} />无工单模式
+                          </Button>
+                        )}
                         {sec.canSync && (
                           <Button size="xs" variant="outline">
                             <RefreshCw size={10} />同步
@@ -1297,6 +1508,328 @@ function DataTablePanel() {
           </div>
         );
       })}
+
+      {noWoOpen && planId && (
+        <NoWorkOrderModal
+          planId={planId}
+          factoryId={factoryId}
+          onClose={() => setNoWoOpen(false)}
+          onSaved={() => {
+            setNoWoOpen(false);
+            setTasksReloadTick(t => t + 1);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── No-Work-Order Task Editor Modal ───────────────────────────────────────────
+interface TaskDraft {
+  key: string;
+  task_id?: string;
+  product_code: string;
+  stage_id: string;
+  line_id: string;
+  plan_quantity: number;
+}
+
+function NoWorkOrderModal({
+  planId, factoryId, onClose, onSaved,
+}: {
+  planId: string;
+  factoryId: string | undefined;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [drafts, setDrafts] = useState<TaskDraft[]>([]);
+  const [products, setProducts] = useState<ProductOut[]>([]);
+  const [stages, setStages] = useState<StageOut[]>([]);
+  const [linesByStage, setLinesByStage] = useState<Record<string, LineOut[]>>({});
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Load products, stages, lines, existing tasks
+  useEffect(() => {
+    if (!factoryId) return;
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      try {
+        const [prods, stageList, existing] = await Promise.all([
+          masterApi.products(),
+          masterApi.stages(factoryId),
+          planApi.tasks(planId),
+        ]);
+        if (cancelled) return;
+        setProducts(prods);
+        setStages(stageList);
+
+        const linesMap: Record<string, LineOut[]> = {};
+        await Promise.all(
+          stageList.map(async s => {
+            try {
+              linesMap[s.stage_id] = await masterApi.lines(s.stage_id);
+            } catch {
+              linesMap[s.stage_id] = [];
+            }
+          }),
+        );
+        if (cancelled) return;
+        setLinesByStage(linesMap);
+
+        setDrafts(
+          existing
+            .slice()
+            .sort((a, b) => a.production_sequence - b.production_sequence)
+            .map((t, i) => ({
+              key: `existing-${t.task_id}-${i}`,
+              task_id: t.task_id,
+              product_code: t.product_code,
+              stage_id: t.stage_id,
+              line_id: t.line_id,
+              plan_quantity: t.plan_quantity,
+            })),
+        );
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [factoryId, planId]);
+
+  const addDraft = () => {
+    const firstStage = stages[0]?.stage_id ?? '';
+    const firstLine = firstStage ? linesByStage[firstStage]?.[0]?.line_id ?? '' : '';
+    setDrafts(prev => [
+      ...prev,
+      {
+        key: `new-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        product_code: products[0]?.product_code ?? '',
+        stage_id: firstStage,
+        line_id: firstLine,
+        plan_quantity: 100,
+      },
+    ]);
+  };
+
+  const updateDraft = (key: string, patch: Partial<TaskDraft>) => {
+    setDrafts(prev => prev.map(d => {
+      if (d.key !== key) return d;
+      const next = { ...d, ...patch };
+      // If stage changed, reset line to first line of new stage
+      if (patch.stage_id && patch.stage_id !== d.stage_id) {
+        next.line_id = linesByStage[patch.stage_id]?.[0]?.line_id ?? '';
+      }
+      return next;
+    }));
+  };
+
+  const removeDraft = (key: string) =>
+    setDrafts(prev => prev.filter(d => d.key !== key));
+
+  const move = (key: string, dir: -1 | 1) => {
+    setDrafts(prev => {
+      const idx = prev.findIndex(d => d.key === key);
+      if (idx < 0) return prev;
+      const target = idx + dir;
+      if (target < 0 || target >= prev.length) return prev;
+      const next = prev.slice();
+      [next[idx], next[target]] = [next[target], next[idx]];
+      return next;
+    });
+  };
+
+  const handleSave = async () => {
+    // Validate
+    for (const [i, d] of drafts.entries()) {
+      if (!d.product_code || !d.stage_id || !d.line_id) {
+        setError(`第 ${i + 1} 行：产品 / 制程 / 产线 均为必填`);
+        return;
+      }
+      if (!d.plan_quantity || d.plan_quantity <= 0) {
+        setError(`第 ${i + 1} 行：计划产量必须大于 0`);
+        return;
+      }
+    }
+    setError(null);
+    setSaving(true);
+    try {
+      await planApi.replaceTasks(
+        planId,
+        drafts.map((d, i) => ({
+          stage_id: d.stage_id,
+          line_id: d.line_id,
+          product_code: d.product_code,
+          plan_quantity: d.plan_quantity,
+          production_sequence: i + 1,
+          data_source: 'MANUAL_NO_WO',
+        })),
+      );
+      onSaved();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+      <div className="bg-[#0b1d30] border border-[#1e3a55] rounded-2xl w-[860px] max-h-[85vh] shadow-2xl overflow-hidden flex flex-col">
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-4 border-b border-[#142235] flex-shrink-0">
+          <div>
+            <h2 className="text-sm font-semibold text-slate-200 flex items-center gap-2">
+              <ClipboardList size={14} className="text-blue-400" />
+              无工单模式 · 生产任务编辑
+            </h2>
+            <p className="text-[11px] text-slate-600 mt-0.5">
+              直接填写生产任务（适用于建厂前产能规划、假设性 what-if 分析）。保存将覆盖该方案当前全部工单。
+            </p>
+          </div>
+          <button onClick={onClose} className="text-slate-600 hover:text-slate-300 transition-colors">
+            <X size={14} />
+          </button>
+        </div>
+
+        {/* Body */}
+        <div className="flex-1 overflow-y-auto p-5">
+          {loading ? (
+            <div className="text-xs text-slate-500 py-6 text-center">加载中…</div>
+          ) : (
+            <>
+              {/* Column header */}
+              <div className="grid grid-cols-[40px_1fr_1fr_1fr_110px_100px] gap-2 px-2 pb-2 text-[10px] text-slate-600 font-medium uppercase tracking-wider">
+                <div>#</div>
+                <div>产品型号</div>
+                <div>制程</div>
+                <div>产线</div>
+                <div>计划产量</div>
+                <div className="text-right">操作</div>
+              </div>
+
+              {drafts.length === 0 ? (
+                <div className="text-xs text-slate-600 py-8 text-center border border-dashed border-[#1e3a55] rounded-lg">
+                  暂无任务，点击下方「添加任务」开始
+                </div>
+              ) : (
+                <div className="space-y-1.5">
+                  {drafts.map((d, i) => {
+                    const stageLines = linesByStage[d.stage_id] ?? [];
+                    return (
+                      <div
+                        key={d.key}
+                        className="grid grid-cols-[40px_1fr_1fr_1fr_110px_100px] gap-2 items-center bg-[#07111e] border border-[#142235] rounded-lg px-2 py-1.5"
+                      >
+                        <div className="text-xs font-mono text-slate-500 text-center">{i + 1}</div>
+                        <Select
+                          value={d.product_code}
+                          onChange={e => updateDraft(d.key, { product_code: e.target.value })}
+                          className="py-1.5"
+                        >
+                          {products.length === 0 && <option value="">—</option>}
+                          {products.map(p => (
+                            <option key={p.product_id} value={p.product_code}>
+                              {p.product_code} · {p.product_name}
+                            </option>
+                          ))}
+                        </Select>
+                        <Select
+                          value={d.stage_id}
+                          onChange={e => updateDraft(d.key, { stage_id: e.target.value })}
+                          className="py-1.5"
+                        >
+                          {stages.length === 0 && <option value="">—</option>}
+                          {stages.map(s => (
+                            <option key={s.stage_id} value={s.stage_id}>
+                              {s.stage_name}
+                            </option>
+                          ))}
+                        </Select>
+                        <Select
+                          value={d.line_id}
+                          onChange={e => updateDraft(d.key, { line_id: e.target.value })}
+                          className="py-1.5"
+                        >
+                          {stageLines.length === 0 && <option value="">该制程暂无产线</option>}
+                          {stageLines.map(l => (
+                            <option key={l.line_id} value={l.line_id}>
+                              {l.line_name}
+                            </option>
+                          ))}
+                        </Select>
+                        <Input
+                          type="number"
+                          min={1}
+                          value={d.plan_quantity}
+                          onChange={e => updateDraft(d.key, { plan_quantity: Number(e.target.value) || 0 })}
+                          className="py-1.5"
+                        />
+                        <div className="flex items-center justify-end gap-1">
+                          <button
+                            onClick={() => move(d.key, -1)}
+                            disabled={i === 0}
+                            className="p-1 rounded text-slate-500 hover:text-slate-200 hover:bg-[#142235] disabled:opacity-30 disabled:cursor-not-allowed"
+                            title="上移"
+                          >
+                            <ArrowUp size={12} />
+                          </button>
+                          <button
+                            onClick={() => move(d.key, 1)}
+                            disabled={i === drafts.length - 1}
+                            className="p-1 rounded text-slate-500 hover:text-slate-200 hover:bg-[#142235] disabled:opacity-30 disabled:cursor-not-allowed"
+                            title="下移"
+                          >
+                            <ArrowDown size={12} />
+                          </button>
+                          <button
+                            onClick={() => removeDraft(d.key)}
+                            className="p-1 rounded text-red-400/70 hover:text-red-400 hover:bg-red-500/10"
+                            title="删除"
+                          >
+                            <Trash2 size={12} />
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              <div className="mt-3">
+                <Button size="xs" variant="outline" onClick={addDraft} disabled={stages.length === 0 || products.length === 0}>
+                  <Plus size={11} />添加任务
+                </Button>
+              </div>
+
+              {error && (
+                <div className="mt-3 flex items-start gap-2 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
+                  <AlertCircle size={11} className="text-red-400 flex-shrink-0 mt-0.5" />
+                  <span className="text-xs text-red-300">{error}</span>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="flex items-center justify-between px-5 py-3 border-t border-[#142235] flex-shrink-0 bg-[#081624]">
+          <span className="text-[11px] text-slate-600">
+            共 {drafts.length} 条任务 · 总计划产量{' '}
+            {drafts.reduce((s, d) => s + (d.plan_quantity || 0), 0).toLocaleString()} pcs
+          </span>
+          <div className="flex gap-2">
+            <Button size="sm" variant="outline" onClick={onClose} disabled={saving}>取消</Button>
+            <Button size="sm" onClick={handleSave} disabled={saving || loading}>
+              {saving ? '保存中…' : '保存'}
+            </Button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1420,7 +1953,23 @@ const SIMULATOR_OPTIONS: Array<{ id: string; label: string; desc: string; cls: s
   { id: 'smt',          label: 'SMT产能规划', desc: '独立月度产能评估，与其他模拟器互斥',   cls: 'bg-amber-500/15 text-amber-400 border-amber-500/25', exclusive: true },
 ];
 
-function ConstraintsPanel({ onOpenVersionManager }: { onOpenVersionManager: (getter: () => Record<string, boolean>, loader: (c: Record<string, boolean>) => void) => void }) {
+// FE constraint id ↔ backend constraint_type (PRD §4.5)
+const CONSTRAINT_FE_TO_BE: Record<string, string> = {
+  'device-fault': 'EQUIPMENT_FAILURE',
+  'material-supply': 'MATERIAL_SUPPLY',
+  'agv-dispatch': 'AGV_TRANSPORT',
+  'wip-buffer': 'WIP_CAPACITY',
+  'workforce': 'MANPOWER',
+};
+const CONSTRAINT_BE_TO_FE: Record<string, string> = Object.fromEntries(
+  Object.entries(CONSTRAINT_FE_TO_BE).map(([k, v]) => [v, k]),
+);
+
+function ConstraintsPanel({ plan, planId, onOpenVersionManager }: {
+  plan: PlanOut | null;
+  planId: string | undefined;
+  onOpenVersionManager: (getter: () => Record<string, boolean>, loader: (c: Record<string, boolean>) => void) => void;
+}) {
   const [enabled, setEnabled] = useState<Record<string, boolean>>(
     Object.fromEntries(CONSTRAINTS_DATA.map(c => [c.id, c.defaultOn]))
   );
@@ -1432,22 +1981,61 @@ function ConstraintsPanel({ onOpenVersionManager }: { onOpenVersionManager: (get
   // 模拟器选择
   const [simulators, setSimulators] = useState<Set<string>>(new Set(['des', 'line-balance']));
 
+  // Sync from plan on load (once per plan)
+  const hydratedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!plan || hydratedRef.current === plan.plan_id) return;
+    hydratedRef.current = plan.plan_id;
+
+    // Duration: prefer 'd' if cleanly divisible by 24
+    const hrs = Number(plan.simulation_duration_hours ?? 0);
+    if (hrs > 0 && hrs % 24 === 0) {
+      setDuration(String(hrs / 24));
+      setDurationUnit('d');
+    } else {
+      setDuration(String(hrs));
+      setDurationUnit('h');
+    }
+
+    // Simulators
+    const feSims = simulatorsToFrontend(plan.enabled_simulators ?? [])
+      .filter(s => SIMULATOR_OPTIONS.some(o => o.id === s));
+    setSimulators(new Set(feSims));
+  }, [plan]);
+
+  // Fetch soft constraints
+  useEffect(() => {
+    if (!planId) return;
+    planApi.constraints(planId).then(rows => {
+      setEnabled(prev => {
+        const next = { ...prev };
+        // Default to OFF per PRD §4.5 when we have the real data
+        for (const c of CONSTRAINTS_DATA) next[c.id] = false;
+        for (const r of rows) {
+          const feId = CONSTRAINT_BE_TO_FE[r.constraint_type];
+          if (feId) next[feId] = r.is_enabled;
+        }
+        return next;
+      });
+    }).catch(() => {});
+  }, [planId]);
+
   const toggleSimulator = (id: string) => {
     const opt = SIMULATOR_OPTIONS.find(o => o.id === id)!;
     setSimulators(prev => {
       const next = new Set(prev);
       if (next.has(id)) {
         next.delete(id);
-        // If removing DES, also remove AGV which depends on it
         if (id === 'des') next.delete('agv');
+      } else if (opt.exclusive) {
+        next.clear();
+        next.add(id);
       } else {
-        if (opt.exclusive) {
-          // SMT is exclusive — clear everything else
-          return new Set([id]);
-        }
-        // If adding any non-SMT, clear SMT
         next.delete('smt');
         next.add(id);
+      }
+      if (planId) {
+        planApi.update(planId, { enabled_simulators: simulatorsToBackend([...next]) }).catch(() => {});
       }
       return next;
     });
@@ -1457,10 +2045,25 @@ function ConstraintsPanel({ onOpenVersionManager }: { onOpenVersionManager: (get
   const durationHours = durationUnit === 'h' ? Number(duration) : Number(duration) * 24;
   const durationExceeds = durationHours > maxDurationHours;
 
+  // Debounced save of duration
+  useEffect(() => {
+    if (!planId || !hydratedRef.current) return;
+    if (durationExceeds || !Number.isFinite(durationHours) || durationHours <= 0) return;
+    const t = setTimeout(() => {
+      planApi.update(planId, { simulation_duration_hours: durationHours }).catch(() => {});
+    }, 500);
+    return () => clearTimeout(t);
+  }, [durationHours, durationExceeds, planId]);
+
   const toggle = (id: string) => {
     const c = CONSTRAINTS_DATA.find(x => x.id === id)!;
     if (c.depId && !enabled[c.depId]) return;
-    setEnabled(prev => ({ ...prev, [id]: !prev[id] }));
+    const nextValue = !enabled[id];
+    setEnabled(prev => ({ ...prev, [id]: nextValue }));
+    const beType = CONSTRAINT_FE_TO_BE[id];
+    if (planId && beType) {
+      planApi.setConstraint(planId, { constraint_type: beType, is_enabled: nextValue }).catch(() => {});
+    }
   };
 
   const enabledCount = Object.values(enabled).filter(Boolean).length;
@@ -1873,8 +2476,6 @@ export function PlanConfigPage() {
   const [expandedIds, setExpandedIds]   = useState<string[]>(['factory', 'lines']);
   const [planStatus, setPlanStatus]     = useState<'DRAFT' | 'READY'>('DRAFT');
 
-  // input completeness: 67% means not all required data configured
-  const inputComplete = 67 === 100;
   const isReady = planStatus === 'READY';
 
   // Version manager modal
@@ -1899,13 +2500,7 @@ export function PlanConfigPage() {
 
   const handleSelect = (id: string) => setSelectedId(prev => prev === id ? null : id);
 
-  const handleSaveReady = async () => {
-    if (!planId) return;
-    try {
-      await planApi.update(planId, { enabled_simulators: plan?.enabled_simulators });
-      setPlanStatus('READY');
-    } catch (e) { console.error('Failed to save plan', e); }
-  };
+  const handleSaveReady = () => setPlanStatus('READY');
   const handleLaunch = () => navigate(`/simulation/plan/${planId}/running`);
 
   const showViewport = ribbonTab === 'params';
@@ -1987,13 +2582,13 @@ export function PlanConfigPage() {
         {/* ── Input / Constraints tab: 3-column panel layout ── */}
         {ribbonTab === 'input' && (
           <div className="flex-1 overflow-hidden flex flex-col min-w-0">
-            <DataTablePanel />
+            <DataTablePanel planId={planId} factoryId={plan?.factory_id} />
           </div>
         )}
 
         {ribbonTab === 'constraints' && (
           <div className="flex-1 overflow-hidden flex flex-col min-w-0">
-            <ConstraintsPanel onOpenVersionManager={handleOpenVersionManager} />
+            <ConstraintsPanel plan={plan} planId={planId} onOpenVersionManager={handleOpenVersionManager} />
           </div>
         )}
       </div>

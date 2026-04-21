@@ -51,6 +51,11 @@ function OutputTab({ result }: { result: SimResultOut | null }) {
   const overallLbr = result?.overall_lbr ? (Number(result.overall_lbr) * 100).toFixed(1) : '—';
   const failureCount = result?.equipment_failure_count ?? 0;
 
+  const hourlyRaw = (result?.result_summary as { hourly_output?: Array<{ hour: number; actual: number; plan: number; defect: number }> } | null)?.hourly_output;
+  const hourlyData = hourlyRaw?.length
+    ? hourlyRaw.map(d => ({ hour: `${d.hour}h`, actual: d.actual, plan: d.plan, defect: d.defect }))
+    : productionOutputData;
+
   return (
     <div className="space-y-5">
       {/* Key Metrics */}
@@ -85,7 +90,7 @@ function OutputTab({ result }: { result: SimResultOut | null }) {
             </div>
           </div>
           <ResponsiveContainer width="100%" height={200}>
-            <ComposedChart data={productionOutputData} margin={{ top: 5, right: 10, left: 0, bottom: 5 }}>
+            <ComposedChart data={hourlyData} margin={{ top: 5, right: 10, left: 0, bottom: 5 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#142235" />
               <XAxis dataKey="hour" tick={{ fill: '#64748b', fontSize: 11 }} axisLine={false} tickLine={false} />
               <YAxis tick={{ fill: '#64748b', fontSize: 11 }} axisLine={false} tickLine={false} />
